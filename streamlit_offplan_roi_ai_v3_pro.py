@@ -1,17 +1,18 @@
-# 🏙️ Off-Plan ROI AI — Oracle Intelligence Cloud v3 (Pro)
-# One-file Streamlit app with correlated Monte-Carlo, regimes, risks, and offline evidence mocks.
+# 🏙️ Off-Plan ROI AI — Oracle Intelligence Cloud v3 (Pro+PDF+Tornado)
+# One-file Streamlit app: regimes, correlated Monte-Carlo, discrete risks, offline mock data,
+# Tornado sensitivity chart, and PDF investor report export.
 # -------------------------------------------------------------------------
 # Run locally:
-#   pip install streamlit plotly pandas numpy
+#   pip install streamlit plotly pandas numpy reportlab
 #   streamlit run streamlit_offplan_roi_ai_v3_pro.py
 # -------------------------------------------------------------------------
 
 import math
 import random
-from math import sqrt
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -19,7 +20,14 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Off-Plan ROI AI — v3 Pro", page_icon="🏙️", layout="wide")
+# PDF (ReportLab)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+
+st.set_page_config(page_title="Off-Plan ROI AI — v3 Pro+", page_icon="🏙️", layout="wide")
 
 # ===============================
 # 📊 Data models & utilities
@@ -383,8 +391,8 @@ DEV_TEMPLATES = {
 # 🧱 Streamlit UI
 # ===============================
 
-st.title("🏙️ Off-Plan ROI AI — Oracle Intelligence v3 (Pro)")
-st.caption("Evidence-based simulator with regimes, correlated Monte-Carlo, discrete risks, and offline mock data connectors.")
+st.title("🏙️ Off-Plan ROI AI — Oracle Intelligence v3 Pro+")
+st.caption("Evidence-based simulator with regimes, correlated Monte-Carlo, discrete risks, offline mock data, Tornado chart, and PDF export.")
 
 # Sidebar — base project inputs
 with st.sidebar:
@@ -559,6 +567,76 @@ sens_df = sensitivity_grid(project)
 st.dataframe(sens_df, use_container_width=True)
 
 # ===============================
+# 🌪️ Tornado Sensitivity (factor impact on Total ROI)
+# ===============================
+
+def tornado_analysis(p: ProjectInput) -> pd.DataFrame:
+    """One-at-a-time sensitivity around current inputs; returns impact range for Total ROI %."""
+    base = OffPlanEngine(p).metrics()["Total ROI %"]
+    tests = [
+        ("Appreciation (pp)", "appr_pp", -2.0, +2.0),
+        ("Annual Rent (±10%)", "rent_pct", -0.10, +0.10),
+        ("Occupancy (pp)", "occ_pp", -5.0, +5.0),
+        ("Service Charges (AED/sqft)", "svc_psf", -3.0, +3.0),
+        ("Maintenance (% rent)", "maint_pp", -2.0, +2.0),
+        ("Selling Costs (pp)", "sell_pp", -1.0, +1.0),
+        ("Handover Delay (months)", "delay_m", +0.0, +3.0),  # only upside delay risk
+    ]
+    rows = []
+    for label, key, low, high in tests:
+        p_low = ProjectInput(**{**p.__dict__})
+        p_high = ProjectInput(**{**p.__dict__})
+        if key == "appr_pp":
+            p_low.appreciation_annual_percent = max(0, p.appreciation_annual_percent + low)
+            p_high.appreciation_annual_percent = p.appreciation_annual_percent + high
+        elif key == "rent_pct":
+            p_low.expected_rent_annual_aed = max(0, p.expected_rent_annual_aed * (1+low))
+            p_high.expected_rent_annual_aed = max(0, p.expected_rent_annual_aed * (1+high))
+        elif key == "occ_pp":
+            p_low.occupancy_percent = max(0, min(100, p.occupancy_percent + low))
+            p_high.occupancy_percent = max(0, min(100, p.occupancy_percent + high))
+        elif key == "svc_psf":
+            p_low.service_charges_aed_per_sqft_year = max(0, p.service_charges_aed_per_sqft_year + low)
+            p_high.service_charges_aed_per_sqft_year = max(0, p.service_charges_aed_per_sqft_year + high)
+        elif key == "maint_pp":
+            p_low.maintenance_percent_of_rent = max(0, p.maintenance_percent_of_rent + low)
+            p_high.maintenance_percent_of_rent = max(0, p.maintenance_percent_of_rent + high)
+        elif key == "sell_pp":
+            p_low.selling_costs_percent = max(0, p.selling_costs_percent + low)
+            p_high.selling_costs_percent = max(0, p.selling_costs_percent + high)
+        elif key == "delay_m":
+            p_low.handover_month = p.handover_month + int(abs(low))  # low here is 0
+            p_high.handover_month = p.handover_month + int(abs(high))
+        # evaluate
+        low_roi = OffPlanEngine(p_low).metrics()["Total ROI %"]
+        high_roi = OffPlanEngine(p_high).metrics()["Total ROI %"]
+        lo, hi = sorted([low_roi, high_roi])
+        impact = hi - lo
+        rows.append({
+            "Factor": label,
+            "Low ROI %": lo,
+            "High ROI %": hi,
+            "Impact (pp)": impact,
+            "Base ROI %": base
+        })
+    df = pd.DataFrame(rows).sort_values("Impact (pp)", ascending=True)
+    return df
+
+st.subheader("🌪️ Tornado Sensitivity — Factor Impact on Total ROI %")
+tornado_df = tornado_analysis(project)
+tornado_fig = go.Figure()
+tornado_fig.add_trace(go.Bar(
+    x=tornado_df["Impact (pp)"],
+    y=tornado_df["Factor"],
+    orientation="h",
+    hovertemplate="Impact: %{x:.2f} pp<extra></extra>"
+))
+tornado_fig.update_layout(title="Tornado Chart (larger bar = bigger effect on Total ROI %)",
+                          xaxis_title="Impact (percentage points)", yaxis_title="")
+st.plotly_chart(tornado_fig, use_container_width=True)
+st.dataframe(tornado_df.reset_index(drop=True), use_container_width=True)
+
+# ===============================
 # 🧠 Advanced Simulation (regimes + risks)
 # ===============================
 
@@ -600,13 +678,63 @@ with st.expander("Backtest & Calibration (offline demo)"):
         st.info("Run the simulation first.")
 
 # ===============================
-# ⬇️ Downloads
+# 📄 PDF investor report
 # ===============================
 
-st.subheader("⬇️ Downloads")
-cf_csv = df_base.to_csv(index=False).encode("utf-8")
-st.download_button("Download Base Cashflow CSV", cf_csv, file_name="cashflow_timeline_base.csv", mime="text/csv")
+def build_pdf(project: ProjectInput, base_metrics: Dict[str,float], mc_summary: Dict[str,float]) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(f"<b>{project.project_name}</b>", styles["Title"]))
+    story.append(Paragraph(f"Developer: {project.developer} | Unit: {project.unit_type}", styles["Normal"]))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
 
+    # Base metrics
+    story.append(Paragraph("<b>Base Metrics</b>", styles["Heading2"]))
+    base_items = [
+        ["Capital ROI %", f"{base_metrics.get('Capital ROI %', float('nan')):,.2f}"],
+        ["Rental ROI %", f"{base_metrics.get('Rental ROI %', float('nan')):,.2f}"],
+        ["Total ROI %", f"{base_metrics.get('Total ROI %', float('nan')):,.2f}"],
+        ["ROE %", f"{base_metrics.get('ROE %', float('nan')):,.2f}"],
+        ["IRR (annual) %", f"{base_metrics.get('IRR (annual) %', float('nan')):,.2f}"],
+    ]
+    t1 = Table(base_items, colWidths=[8*cm, 4*cm])
+    t1.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey),
+                            ('BACKGROUND',(0,0),(-1,0),colors.whitesmoke),
+                            ('FONT',(0,0),(-1,0),'Helvetica-Bold')]))
+    story.append(t1)
+    story.append(Spacer(1, 10))
+
+    # Monte Carlo summary
+    story.append(Paragraph("<b>Monte-Carlo Summary</b>", styles["Heading2"]))
+    mc_items = [[k, f"{v:,.2f}"] for k,v in mc_summary.items()]
+    t2 = Table(mc_items, colWidths=[8*cm, 4*cm])
+    t2.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey)]))
+    story.append(t2)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Notes: This model uses regime-based, correlated simulations with discrete risk events. "
+                           "All results are estimates and not financial advice.", styles["Italic"]))
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+st.subheader("📄 Export")
+col_pdf, col_csv = st.columns([1,1])
+with col_pdf:
+    pdf_bytes = build_pdf(project, met, summary)
+    st.download_button("Download Investor PDF", data=pdf_bytes,
+                       file_name=f"{project.project_name.replace(' ','_')}_Investor_Report.pdf",
+                       mime="application/pdf")
+with col_csv:
+    cf_csv = df_base.to_csv(index=False).encode("utf-8")
+    st.download_button("Download Base Cashflow CSV", cf_csv, file_name="cashflow_timeline_base.csv", mime="text/csv")
+
+# Simulation CSV (full)
 sim_csv = sim_df.to_csv(index=False).encode("utf-8")
 st.download_button("Download Simulation Results CSV", sim_csv, file_name="simulation_results.csv", mime="text/csv")
 
