@@ -1,10 +1,15 @@
-# 🏙️ Off-Plan ROI AI — Oracle Intelligence Cloud v3 (Pro+PDF+Tornado)
-# One-file Streamlit app: regimes, correlated Monte-Carlo, discrete risks, offline mock data,
-# Tornado sensitivity chart, and PDF investor report export.
+# 🏙️ Off-Plan ROI AI — Oracle Intelligence Cloud v4 (Portfolio + Auth)
+# Features:
+# - Evidence mocks (DLD/RERA/PF/mortgage/service charges)
+# - Correlated Monte-Carlo with Bear/Base/Bull regimes + discrete risks
+# - Tornado chart (factor impact)
+# - PDF investor report
+# - NEW: Auth gate (username/password via st.secrets["USERS"] or guest fallback)
+# - NEW: Portfolio Mode (save multiple projects, compare, weighted portfolio simulation)
 # -------------------------------------------------------------------------
 # Run locally:
 #   pip install streamlit plotly pandas numpy reportlab
-#   streamlit run streamlit_offplan_roi_ai_v3_pro.py
+#   streamlit run streamlit_offplan_roi_ai_v4_portfolio_auth.py
 # -------------------------------------------------------------------------
 
 import math
@@ -20,17 +25,52 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-# PDF (ReportLab)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 
-st.set_page_config(page_title="Off-Plan ROI AI — v3 Pro+", page_icon="🏙️", layout="wide")
+st.set_page_config(page_title="Off-Plan ROI AI — v4 Portfolio", page_icon="🏙️", layout="wide")
 
 # ===============================
-# 📊 Data models & utilities
+# Auth (simple)
+# ===============================
+
+def check_auth():
+    users = {}
+    try:
+        users = dict(st.secrets.get("USERS", {}))
+    except Exception:
+        users = {}
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+
+    with st.sidebar:
+        st.markdown("### 🔐 Login")
+        u = st.text_input("Username", value="", key="auth_user")
+        p = st.text_input("Password", type="password", value="", key="auth_pass")
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Sign in"):
+                if users:
+                    st.session_state.auth_ok = (u in users and p == users[u])
+                else:
+                    # fallback demo mode if no secrets configured
+                    st.session_state.auth_ok = (u.strip() != "" and p.strip() != "")
+        with colB:
+            if st.button("Sign out"):
+                st.session_state.auth_ok = False
+                st.stop()
+
+    if not st.session_state.auth_ok:
+        st.info("Enter your credentials to access the app. (If no USERS secret is set, any non-empty credentials work for demo.)")
+        st.stop()
+
+check_auth()
+
+# ===============================
+# Data models & utilities
 # ===============================
 
 @dataclass
@@ -70,24 +110,23 @@ class ProjectInput:
 
 @dataclass
 class MarketRegimes:
-    # annual means (percentage points) and vols (as % of mean) for each regime
-    appr_mu_pp: Dict[str, float]             # {'bear':2, 'base':8, 'bull':14}
-    appr_vol_pct: Dict[str, float]           # {'bear':0.35, ...}
-    rent_mu_pct: Dict[str, float]            # rent scale drift per year (bear/base/bull)
+    appr_mu_pp: Dict[str, float]
+    appr_vol_pct: Dict[str, float]
+    rent_mu_pct: Dict[str, float]
     rent_vol_pct: Dict[str, float]
-    weights: Dict[str, float]                # probabilities sum to 1
+    weights: Dict[str, float]
 
 @dataclass
 class RiskToggles:
-    rho_price_rent: float = 0.45             # correlation of shocks
-    handover_delay_mean_m: float = 2.0       # months
+    rho_price_rent: float = 0.45
+    handover_delay_mean_m: float = 2.0
     handover_delay_sd_m: float = 1.0
     vacancy_days_per_year: int = 18
     rent_free_months_on_first_lease: float = 0.0
     refinance_prob: float = 0.15
-    refinance_rate_delta_pp: float = -0.5    # drop after refi (pp)
+    refinance_rate_delta_pp: float = -0.5
     early_exit_prob: float = 0.10
-    early_exit_month_shift: int = -6         # sell 6 months earlier
+    early_exit_month_shift: int = -6
     svc_inflation_pct_pa: float = 4.0
 
 def month_to_date(month_offset: int, start: Optional[datetime] = None) -> datetime:
@@ -111,7 +150,6 @@ def npv_monthly(rate_annual: float, series: List[float]) -> float:
     return sum(cf / ((1 + r) ** i) for i, cf in enumerate(series))
 
 def irr_from_series(series: List[float]) -> float:
-    # robust bisection for annual IRR using monthly discounting
     low, high = -0.99, 5.0
     for _ in range(120):
         mid = (low + high) / 2
@@ -126,7 +164,7 @@ def irr_from_series(series: List[float]) -> float:
     return (low + high) / 2
 
 # ===============================
-# ⚙️ Core Engine
+# Core Engine
 # ===============================
 
 class OffPlanEngine:
@@ -147,14 +185,11 @@ class OffPlanEngine:
 
     def _build(self):
         p = self.p
-        # EOI
         if p.eoi_aed > 0:
             self._add(0, "EOI", p.eoi_aed, eq=p.eoi_aed)
 
-        # Buy fees at booking
         buy_fees = p.base_price_aed * (p.dld_fee_percent + p.agency_buy_percent + p.other_buy_fees_percent) / 100.0
 
-        # Milestones
         for m in p.payment_plan:
             amt = m.flat_aed if m.flat_aed > 0 else p.base_price_aed * (m.percent / 100.0)
             if m.month == 0 and buy_fees > 0:
@@ -163,11 +198,9 @@ class OffPlanEngine:
             else:
                 self._add(m.month, m.milestone, amt, eq=amt)
 
-        # Furnishing at handover
         if p.furnishing_aed > 0:
             self._add(p.handover_month, "Furnishing", p.furnishing_aed, eq=p.furnishing_aed)
 
-        # Mortgage (optional; simple treatment)
         if p.use_mortgage and p.ltv_percent > 0:
             loan = p.base_price_aed * (p.ltv_percent / 100.0)
             self._add(p.handover_month, "Mortgage Proceeds (Loan)", -loan, eq=0.0)
@@ -175,7 +208,6 @@ class OffPlanEngine:
             for i in range(p.mortgage_years * 12):
                 self._add(p.handover_month + i, "Mortgage Payment", pay, eq=0.0)
 
-        # Rental inflows
         if p.expected_rent_annual_aed > 0 and p.years_rented_post_handover > 0:
             months = int(round(p.years_rented_post_handover * 12))
             gross = p.expected_rent_annual_aed / 12.0
@@ -186,7 +218,6 @@ class OffPlanEngine:
             for i in range(months):
                 self._add(p.handover_month + i, "Net Rent Inflow", -max(0.0, net))
 
-        # Sale proceeds
         years = max(0.0, p.sale_month_from_start / 12.0)
         sale_price = p.base_price_aed * ((1 + p.appreciation_annual_percent / 100.0) ** years)
         sell_costs = sale_price * (p.agency_sell_percent + p.selling_costs_percent) / 100.0
@@ -221,7 +252,7 @@ class OffPlanEngine:
         }
 
 # ===============================
-# 🔧 Sensitivity grid (bear/base/bull)
+# Sensitivity, mocks, regimes, risks, simulation
 # ===============================
 
 def sensitivity_grid(p: ProjectInput, appr_shifts_pp=(-5,0,5), rent_shifts_pct=(-0.10,0.0,0.10)) -> pd.DataFrame:
@@ -243,15 +274,11 @@ def sensitivity_grid(p: ProjectInput, appr_shifts_pp=(-5,0,5), rent_shifts_pct=(
             })
     return pd.DataFrame(rows)
 
-# ===============================
-# 📡 Offline evidence mocks
-# ===============================
-
 def mock_dld_comps(area:str, project:str):
     seed = abs(hash((area, project))) % 10_000
     random.seed(seed)
     avg_psf = random.randint(1700, 3200)
-    mu_app = random.uniform(5.5, 11.0)     # annual pp
+    mu_app = random.uniform(5.5, 11.0)
     return {"avg_psf": avg_psf, "appreciation_mu_pp": mu_app}
 
 def mock_rera_pf(area:str, unit_type:str):
@@ -266,17 +293,24 @@ def mock_mortgage_quotes(base_price:float):
     random.seed(seed)
     ltv = random.choice([50, 60, 70, 75, 80])
     rate = random.uniform(4.5, 6.5)
-    bank_fees = base_price * random.uniform(0.003, 0.007)  # 0.3–0.7%
+    bank_fees = base_price * random.uniform(0.003, 0.007)
     return {"ltv": ltv, "rate": rate, "bank_fees": bank_fees}
 
 def mock_service_charges(project:str, sqft:float):
     seed = abs(hash((project, sqft))) % 10_000
     random.seed(seed)
-    svc_psf = random.uniform(18, 32)  # AED/sqft/year
+    svc_psf = random.uniform(18, 32)
     return {"svc_psf": svc_psf}
 
+@dataclass
+class MarketRegimes:
+    appr_mu_pp: Dict[str, float]
+    appr_vol_pct: Dict[str, float]
+    rent_mu_pct: Dict[str, float]
+    rent_vol_pct: Dict[str, float]
+    weights: Dict[str, float]
+
 def build_regimes_from_data(dld_mu_pp: float) -> MarketRegimes:
-    # tie base regime to DLD-derived appreciation mean
     bear_mu = max(0.0, dld_mu_pp - 6)
     base_mu = dld_mu_pp
     bull_mu = dld_mu_pp + 6
@@ -288,52 +322,44 @@ def build_regimes_from_data(dld_mu_pp: float) -> MarketRegimes:
         weights={"bear": 0.25, "base": 0.55, "bull": 0.20},
     )
 
-# ===============================
-# 🧠 Correlated Monte-Carlo (regimes + discrete risks)
-# ===============================
+@dataclass
+class RiskToggles:
+    rho_price_rent: float = 0.45
+    handover_delay_mean_m: float = 2.0
+    handover_delay_sd_m: float = 1.0
+    vacancy_days_per_year: int = 18
+    rent_free_months_on_first_lease: float = 0.0
+    refinance_prob: float = 0.15
+    refinance_rate_delta_pp: float = -0.5
+    early_exit_prob: float = 0.10
+    early_exit_month_shift: int = -6
+    svc_inflation_pct_pa: float = 4.0
 
-def simulate_roi_distribution_advanced(
-    p: ProjectInput,
-    regimes: MarketRegimes,
-    risks: RiskToggles,
-    n_iter: int = 10000
-) -> pd.DataFrame:
+def simulate_roi_distribution_advanced(p: ProjectInput, regimes: MarketRegimes, risks: RiskToggles, n_iter: int = 10000) -> pd.DataFrame:
     rho = max(min(risks.rho_price_rent, 0.99), -0.99)
     cov = np.array([[1.0, rho],[rho,1.0]])
     L = np.linalg.cholesky(cov)
 
     rows = []
     reg_names = list(regimes.weights.keys())
-    reg_probs = np.array([regimes.weights[k] for k in reg_names])
-    reg_probs = reg_probs / reg_probs.sum()
+    reg_probs = np.array([regimes.weights[k] for k in reg_names]); reg_probs /= reg_probs.sum()
 
     for _ in range(n_iter):
-        # draw regime
         regime = np.random.choice(reg_names, p=reg_probs)
-
-        # correlated shocks
         z = np.dot(L, np.random.normal(size=2))
-
-        # appreciation (annual pp)
         appr_mu = regimes.appr_mu_pp[regime]
         appr_vol = max(0.0001, abs(appr_mu) * regimes.appr_vol_pct[regime])
         appr_draw = max(0.0, appr_mu + z[0] * appr_vol)
-
-        # rent scale
         rent_mu = regimes.rent_mu_pct[regime]
         rent_vol = max(0.0001, max(0.02, abs(rent_mu)) * regimes.rent_vol_pct[regime])
-        rent_scale = 1.0 + (rent_mu + z[1]*rent_vol)
-        rent_scale = max(0.6, min(1.4, rent_scale))
+        rent_scale = max(0.6, min(1.4, 1.0 + (rent_mu + z[1]*rent_vol)))
 
-        # clone and apply draws
         p2 = ProjectInput(**{**p.__dict__})
         p2.appreciation_annual_percent = appr_draw
         p2.expected_rent_annual_aed = max(0.0, p.expected_rent_annual_aed * rent_scale)
-        # occupancy from vacancy days
         occ_days = max(0, int(risks.vacancy_days_per_year))
         p2.occupancy_percent = max(0, min(100, (365 - occ_days) / 365 * 100))
 
-        # discrete risks
         delay = max(0, int(np.random.normal(risks.handover_delay_mean_m, risks.handover_delay_sd_m)))
         p2.handover_month = p.handover_month + delay
 
@@ -341,42 +367,28 @@ def simulate_roi_distribution_advanced(
             rf = int(risks.rent_free_months_on_first_lease)
             p2.years_rented_post_handover = max(0.0, p.years_rented_post_handover - rf/12.0)
 
-        refi = (np.random.rand() < risks.refinance_prob)
-        if refi and p.use_mortgage:
+        if (np.random.rand() < risks.refinance_prob) and p.use_mortgage:
             p2.mortgage_rate_annual_percent = max(0.0, p.mortgage_rate_annual_percent + risks.refinance_rate_delta_pp)
 
-        early = (np.random.rand() < risks.early_exit_prob)
-        if early:
+        if np.random.rand() < risks.early_exit_prob:
             p2.sale_month_from_start = max(1, p.sale_month_from_start + risks.early_exit_month_shift)
 
-        # service-charge inflation (terminal uplift approximation)
         if p2.service_charges_aed_per_sqft_year > 0 and p2.years_rented_post_handover>0:
             years = p2.years_rented_post_handover
             infl = (1 + risks.svc_inflation_pct_pa/100.0) ** years
             p2.service_charges_aed_per_sqft_year *= infl
 
-        # evaluate
-        e = OffPlanEngine(p2)
-        m = e.metrics()
-        rows.append({
-            "regime": regime,
-            "Total ROI %": m["Total ROI %"],
-            "Capital ROI %": m["Capital ROI %"],
-            "Rental ROI %": m["Rental ROI %"],
-            "ROE %": m["ROE %"],
-        })
+        m = OffPlanEngine(p2).metrics()
+        rows.append({"regime": regime, "Total ROI %": m["Total ROI %"], "Capital ROI %": m["Capital ROI %"], "Rental ROI %": m["Rental ROI %"], "ROE %": m["ROE %"]})
     return pd.DataFrame(rows)
 
-# Downside helpers
-def pctl(arr, q): 
-    return float(np.percentile(arr, q))
-
+def pctl(arr, q): return float(np.percentile(arr, q))
 def cvar(arr, tail=10):
     cutoff = np.percentile(arr, tail)
     return float(np.mean(arr[arr <= cutoff]))
 
 # ===============================
-# 🧱 Developer templates (for quick start)
+# Developer templates
 # ===============================
 
 DEV_TEMPLATES = {
@@ -388,13 +400,12 @@ DEV_TEMPLATES = {
 }
 
 # ===============================
-# 🧱 Streamlit UI
+# UI — Base project
 # ===============================
 
-st.title("🏙️ Off-Plan ROI AI — Oracle Intelligence v3 Pro+")
-st.caption("Evidence-based simulator with regimes, correlated Monte-Carlo, discrete risks, offline mock data, Tornado chart, and PDF export.")
+st.title("🏙️ Off-Plan ROI AI — Oracle Intelligence v4 (Portfolio + Auth)")
+st.caption("Evidence-based simulator with regimes, correlated Monte-Carlo, discrete risks, Tornado, PDF, and portfolio comparison.")
 
-# Sidebar — base project inputs
 with st.sidebar:
     st.header("📈 Project Setup")
     dev_choice = st.selectbox("Developer", list(DEV_TEMPLATES.keys()), index=0)
@@ -471,84 +482,57 @@ with st.sidebar:
     early_shift = st.slider("Early exit month shift", -12, 0, -6)
     svc_infl = st.slider("Service charge inflation %/yr", 0.0, 10.0, 4.0, 0.5)
 
-# Build project instance from sidebar
+# Build project
 project = ProjectInput(
     project_name=name, developer=developer, unit_type=unit_type,
     base_price_aed=base_price, size_sqft=size_sqft,
     handover_month=handover_m, sale_month_from_start=sale_m,
     dld_fee_percent=dld, agency_buy_percent=agency_buy, agency_sell_percent=agency_sell,
     other_buy_fees_percent=other_buy, selling_costs_percent=exit_cost, eoi_aed=eoi,
-    payment_plan=[
-        PaymentMilestone(m1_name, m1_pct, m1_month),
-        PaymentMilestone(m2_name, m2_pct, m2_month),
-        PaymentMilestone(m3_name, m3_pct, m3_month),
-    ],
+    payment_plan=[PaymentMilestone(m1_name, m1_pct, m1_month),
+                  PaymentMilestone(m2_name, m2_pct, m2_month),
+                  PaymentMilestone(m3_name, m3_pct, m3_month)],
     appreciation_annual_percent=appr, expected_rent_annual_aed=rent, years_rented_post_handover=years_rent,
     occupancy_percent=float(occ), service_charges_aed_per_sqft_year=svc, maintenance_percent_of_rent=maint,
     furnishing_aed=furnish, use_mortgage=use_mort, ltv_percent=ltv, mortgage_rate_annual_percent=mort_rate, mortgage_years=mort_years
 )
 
-# ===============================
-# 🔎 Apply offline evidence mocks (optional)
-# ===============================
-
+# Apply mocks (optional)
 if use_mocks:
     dld_data = mock_dld_comps(area, project_name_input)
     rent_data = mock_rera_pf(area, unit_type_ui)
-    mort_data = mock_mortgage_quotes(base_price)
     svc_data = mock_service_charges(project_name_input, size_sqft)
-
-    # non-destructive override of key assumptions (you can still tweak in UI)
     project.expected_rent_annual_aed = rent_data["annual_rent"]
     project.occupancy_percent = rent_data["occupancy"] * 100
     project.service_charges_aed_per_sqft_year = svc_data["svc_psf"]
-
     regimes = build_regimes_from_data(dld_data["appreciation_mu_pp"])
 else:
     regimes = build_regimes_from_data(project.appreciation_annual_percent)
 
-# normalize regime weights from sliders
 regimes.weights = {"bear": bear_w/total_w, "base": base_w/total_w, "bull": bull_w/total_w}
+risks = RiskToggles(rho_price_rent=rho, handover_delay_mean_m=delay_mean, handover_delay_sd_m=delay_sd,
+                    vacancy_days_per_year=vac_days, rent_free_months_on_first_lease=rent_free,
+                    refinance_prob=refi_prob, refinance_rate_delta_pp=refi_delta,
+                    early_exit_prob=early_prob, early_exit_month_shift=early_shift,
+                    svc_inflation_pct_pa=svc_infl)
 
-risks = RiskToggles(
-    rho_price_rent=rho,
-    handover_delay_mean_m=delay_mean,
-    handover_delay_sd_m=delay_sd,
-    vacancy_days_per_year=vac_days,
-    rent_free_months_on_first_lease=rent_free,
-    refinance_prob=refi_prob,
-    refinance_rate_delta_pp=refi_delta,
-    early_exit_prob=early_prob,
-    early_exit_month_shift=early_shift,
-    svc_inflation_pct_pa=svc_infl
-)
-
-# ===============================
-# 📊 Base metrics (deterministic)
-# ===============================
-
+# Base metrics & charts
 engine = OffPlanEngine(project)
-df_base = engine.df()
-tot = engine.totals()
-met = engine.metrics()
-
+df_base = engine.df(); tot = engine.totals(); met = engine.metrics()
 st.subheader("📌 Base Case Metrics (deterministic)")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total Outflows (AED)", f"{tot['outflows']:,.0f}")
-k2.metric("Total Inflows (AED)", f"{tot['inflows']:,.0f}")
-k3.metric("Net Profit (AED)", f"{tot['profit']:,.0f}")
-k4.metric("ROE %", f"{met['ROE %']:.2f}%")
-
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Outflows (AED)", f"{tot['outflows']:,.0f}")
+c2.metric("Total Inflows (AED)", f"{tot['inflows']:,.0f}")
+c3.metric("Net Profit (AED)", f"{tot['profit']:,.0f}")
+c4.metric("ROE %", f"{met['ROE %']:.2f}%")
 m1, m2, m3 = st.columns(3)
 m1.metric("Capital ROI %", f"{met['Capital ROI %']:.2f}%")
 m2.metric("Rental ROI %", f"{met['Rental ROI %']:.2f}%")
 m3.metric("Total ROI %", f"{met['Total ROI %']:.2f}%")
 
-# Charts — cashflow & equity
 st.subheader("💰 Cashflow Timeline (Base Case)")
-cf_fig = px.bar(df_base, x="date", y="cashflow_aed", color="description",
-                title="Monthly Cashflows (Outflows + / Inflows -)")
-st.plotly_chart(cf_fig, use_container_width=True)
+st.plotly_chart(px.bar(df_base, x="date", y="cashflow_aed", color="description",
+                       title="Monthly Cashflows (Outflows + / Inflows -)"), use_container_width=True)
 
 st.subheader("📈 Equity Accumulation (Cumulative Cashflow)")
 df_sorted = df_base.sort_values("date").copy()
@@ -558,20 +542,12 @@ eq_fig.add_trace(go.Scatter(x=df_sorted["date"], y=df_sorted["cum_cash"], mode="
 eq_fig.update_layout(xaxis_title="Date", yaxis_title="AED")
 st.plotly_chart(eq_fig, use_container_width=True)
 
-# ===============================
-# 🧪 Sensitivity Grid (Bear / Base / Bull)
-# ===============================
-
+# Sensitivity grid
 st.subheader("🧪 Sensitivity Grid (Bear / Base / Bull)")
-sens_df = sensitivity_grid(project)
-st.dataframe(sens_df, use_container_width=True)
+st.dataframe(sensitivity_grid(project), use_container_width=True)
 
-# ===============================
-# 🌪️ Tornado Sensitivity (factor impact on Total ROI)
-# ===============================
-
+# Tornado
 def tornado_analysis(p: ProjectInput) -> pd.DataFrame:
-    """One-at-a-time sensitivity around current inputs; returns impact range for Total ROI %."""
     base = OffPlanEngine(p).metrics()["Total ROI %"]
     tests = [
         ("Appreciation (pp)", "appr_pp", -2.0, +2.0),
@@ -580,12 +556,11 @@ def tornado_analysis(p: ProjectInput) -> pd.DataFrame:
         ("Service Charges (AED/sqft)", "svc_psf", -3.0, +3.0),
         ("Maintenance (% rent)", "maint_pp", -2.0, +2.0),
         ("Selling Costs (pp)", "sell_pp", -1.0, +1.0),
-        ("Handover Delay (months)", "delay_m", +0.0, +3.0),  # only upside delay risk
+        ("Handover Delay (months)", "delay_m", +0.0, +3.0),
     ]
     rows = []
     for label, key, low, high in tests:
-        p_low = ProjectInput(**{**p.__dict__})
-        p_high = ProjectInput(**{**p.__dict__})
+        p_low = ProjectInput(**{**p.__dict__}); p_high = ProjectInput(**{**p.__dict__})
         if key == "appr_pp":
             p_low.appreciation_annual_percent = max(0, p.appreciation_annual_percent + low)
             p_high.appreciation_annual_percent = p.appreciation_annual_percent + high
@@ -605,95 +580,143 @@ def tornado_analysis(p: ProjectInput) -> pd.DataFrame:
             p_low.selling_costs_percent = max(0, p.selling_costs_percent + low)
             p_high.selling_costs_percent = max(0, p.selling_costs_percent + high)
         elif key == "delay_m":
-            p_low.handover_month = p.handover_month + int(abs(low))  # low here is 0
+            p_low.handover_month = p.handover_month + int(abs(low))
             p_high.handover_month = p.handover_month + int(abs(high))
-        # evaluate
-        low_roi = OffPlanEngine(p_low).metrics()["Total ROI %"]
-        high_roi = OffPlanEngine(p_high).metrics()["Total ROI %"]
-        lo, hi = sorted([low_roi, high_roi])
-        impact = hi - lo
-        rows.append({
-            "Factor": label,
-            "Low ROI %": lo,
-            "High ROI %": hi,
-            "Impact (pp)": impact,
-            "Base ROI %": base
-        })
-    df = pd.DataFrame(rows).sort_values("Impact (pp)", ascending=True)
-    return df
+        lo = OffPlanEngine(p_low).metrics()["Total ROI %"]
+        hi = OffPlanEngine(p_high).metrics()["Total ROI %"]
+        lo, hi = sorted([lo, hi])
+        rows.append({"Factor": label, "Low ROI %": lo, "High ROI %": hi, "Impact (pp)": hi - lo, "Base ROI %": base})
+    return pd.DataFrame(rows).sort_values("Impact (pp)", ascending=True)
 
-st.subheader("🌪️ Tornado Sensitivity — Factor Impact on Total ROI %")
+st.subheader("🌪️ Tornado — Factor Impact on Total ROI %")
 tornado_df = tornado_analysis(project)
-tornado_fig = go.Figure()
-tornado_fig.add_trace(go.Bar(
-    x=tornado_df["Impact (pp)"],
-    y=tornado_df["Factor"],
-    orientation="h",
-    hovertemplate="Impact: %{x:.2f} pp<extra></extra>"
-))
-tornado_fig.update_layout(title="Tornado Chart (larger bar = bigger effect on Total ROI %)",
-                          xaxis_title="Impact (percentage points)", yaxis_title="")
-st.plotly_chart(tornado_fig, use_container_width=True)
+fig_tornado = go.Figure(go.Bar(x=tornado_df["Impact (pp)"], y=tornado_df["Factor"], orientation="h"))
+fig_tornado.update_layout(title="Tornado Chart (bigger bar = bigger effect)", xaxis_title="Impact (pp)", yaxis_title="")
+st.plotly_chart(fig_tornado, use_container_width=True)
 st.dataframe(tornado_df.reset_index(drop=True), use_container_width=True)
 
-# ===============================
-# 🧠 Advanced Simulation (regimes + risks)
-# ===============================
-
-st.subheader("🧠 Monte-Carlo (Regimes + Correlation + Discrete Risks)")
-with st.spinner("Running correlated Monte-Carlo with regimes & risks ..."):
-    sim_df = simulate_roi_distribution_advanced(project, regimes, risks, n_iter=int(sims))
-
-arr = sim_df["Total ROI %"].dropna().to_numpy()
-summary = {
+# Advanced Simulation (single project)
+st.subheader("🧠 Monte-Carlo (Regimes + Correlation + Discrete Risks) — Single Project")
+with st.spinner("Running simulation ..."):
+    sim_df_single = simulate_roi_distribution_advanced(project, regimes, risks, n_iter=int(sims))
+arr = sim_df_single["Total ROI %"].dropna().to_numpy()
+summary_single = {
     "Mean ROI %": float(np.mean(arr)) if arr.size else float("nan"),
     "Median ROI %": float(np.median(arr)) if arr.size else float("nan"),
     "P50 ROI %": pctl(arr, 50) if arr.size else float("nan"),
     "P90 ROI % (downside)": pctl(arr, 10) if arr.size else float("nan"),
     "CVaR (worst 10%) %": cvar(arr, 10) if arr.size else float("nan"),
 }
-
 c1, c2 = st.columns([2,1])
 with c1:
-    st.plotly_chart(px.histogram(sim_df, x="Total ROI %", nbins=50, title="Simulated Total ROI %"), use_container_width=True)
-    st.plotly_chart(px.box(sim_df, y="Total ROI %", points=False, title="ROI Spread (Boxplot)"), use_container_width=True)
+    st.plotly_chart(px.histogram(sim_df_single, x="Total ROI %", nbins=50, title="Simulated Total ROI %"), use_container_width=True)
 with c2:
-    st.write("**Downside & Summary Metrics**")
-    st.json(summary)
-    regime_share = sim_df["regime"].value_counts(normalize=True).rename("share").reset_index(names="regime")
-    st.plotly_chart(px.pie(regime_share, names="regime", values="share", title="Regime Mix (simulated)"), use_container_width=True)
+    st.write("**Downside & Summary (Single Project)**"); st.json(summary_single)
 
 # ===============================
-# 🧪 Backtest & calibration (demo)
+# 📁 Portfolio Mode
 # ===============================
 
-with st.expander("Backtest & Calibration (offline demo)"):
-    if arr.size:
-        realized = arr + np.random.normal(0, np.std(arr)*0.2, size=len(arr))
-        pred_std = float(np.std(arr)); real_std = float(np.std(realized))
-        scale = 1.0 if pred_std==0 else max(0.5, min(2.0, real_std / pred_std))
-        st.write({"pred_std": pred_std, "real_std": real_std, "vol_scale": scale})
-        st.caption("Replace synthetic 'realized' with your historical ROI per project to tune distributions.")
+st.markdown("---")
+st.header("📁 Portfolio Mode")
+
+# init
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = []   # list of dicts: {"name":..., "project": ProjectInput, "regimes":..., "risks":...}
+
+colP1, colP2, colP3 = st.columns([1,1,1])
+with colP1:
+    if st.button("➕ Add current project to portfolio"):
+        st.session_state.portfolio.append({
+            "name": project.project_name,
+            "project": ProjectInput(**{**project.__dict__}),
+            "regimes": MarketRegimes(**{**regimes.__dict__}),
+            "risks": RiskToggles(**{**risks.__dict__})
+        })
+with colP2:
+    if st.button("🗑️ Clear portfolio"):
+        st.session_state.portfolio = []
+with colP3:
+    st.write(f"Items: **{len(st.session_state.portfolio)}**")
+
+if st.session_state.portfolio:
+    # Table of metrics
+    rows = []
+    for i, item in enumerate(st.session_state.portfolio):
+        pi = item["project"]
+        m = OffPlanEngine(pi).metrics()
+        rows.append({
+            "Index": i,
+            "Project": pi.project_name,
+            "Developer": pi.developer,
+            "Total ROI %": m["Total ROI %"],
+            "Capital ROI %": m["Capital ROI %"],
+            "Rental ROI %": m["Rental ROI %"],
+            "ROE %": m["ROE %"],
+        })
+    df_port = pd.DataFrame(rows)
+    st.subheader("Projects Overview")
+    st.dataframe(df_port, use_container_width=True)
+
+    # Editable weights
+    st.subheader("Portfolio Weights")
+    if "weights_df" not in st.session_state or len(st.session_state.weights_df) != len(df_port):
+        st.session_state.weights_df = pd.DataFrame({
+            "Index": df_port["Index"],
+            "Project": df_port["Project"],
+            "Weight": np.round(1.0/len(df_port), 3)
+        })
+    st.session_state.weights_df = st.data_editor(st.session_state.weights_df, num_rows="dynamic", use_container_width=True)
+    weights = st.session_state.weights_df["Weight"].to_numpy()
+    if weights.sum() == 0:
+        weights = np.ones_like(weights)/len(weights)
     else:
-        st.info("Run the simulation first.")
+        weights = weights / weights.sum()
+
+    # Run simulations per project; combine into portfolio
+    st.subheader("Portfolio Simulation (weighted)")
+    n_iter = int(sims)
+    # Collect sampled ROI arrays
+    sampled = []
+    for item in st.session_state.portfolio:
+        sim_df = simulate_roi_distribution_advanced(item["project"], item["regimes"], item["risks"], n_iter=n_iter)
+        sampled.append(sim_df["Total ROI %"].to_numpy())
+    # Align lengths
+    min_len = min(len(a) for a in sampled)
+    sampled = [a[:min_len] for a in sampled]
+    W = weights[:len(sampled)]
+    # Weighted portfolio ROI per iteration
+    port_arr = np.zeros(min_len)
+    for i in range(len(sampled)):
+        port_arr += W[i] * sampled[i]
+
+    port_summary = {
+        "Mean ROI %": float(np.mean(port_arr)) if port_arr.size else float("nan"),
+        "Median ROI %": float(np.median(port_arr)) if port_arr.size else float("nan"),
+        "P50 ROI %": pctl(port_arr, 50) if port_arr.size else float("nan"),
+        "P90 ROI % (downside)": pctl(port_arr, 10) if port_arr.size else float("nan"),
+        "CVaR (worst 10%) %": cvar(port_arr, 10) if port_arr.size else float("nan"),
+    }
+
+    cpa, cpb = st.columns([2,1])
+    with cpa:
+        st.plotly_chart(px.histogram(port_arr, nbins=50, title="Portfolio Total ROI % (Simulated)"), use_container_width=True)
+    with cpb:
+        st.write("**Portfolio Downside & Summary**"); st.json(port_summary)
 
 # ===============================
-# 📄 PDF investor report
+# PDF Export (single-project)
 # ===============================
 
 def build_pdf(project: ProjectInput, base_metrics: Dict[str,float], mc_summary: Dict[str,float]) -> bytes:
     buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                            leftMargin=2*cm, rightMargin=2*cm,
-                            topMargin=2*cm, bottomMargin=2*cm)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
     styles = getSampleStyleSheet()
     story = []
     story.append(Paragraph(f"<b>{project.project_name}</b>", styles["Title"]))
     story.append(Paragraph(f"Developer: {project.developer} | Unit: {project.unit_type}", styles["Normal"]))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
     story.append(Spacer(1, 12))
-
-    # Base metrics
     story.append(Paragraph("<b>Base Metrics</b>", styles["Heading2"]))
     base_items = [
         ["Capital ROI %", f"{base_metrics.get('Capital ROI %', float('nan')):,.2f}"],
@@ -706,36 +729,30 @@ def build_pdf(project: ProjectInput, base_metrics: Dict[str,float], mc_summary: 
     t1.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey),
                             ('BACKGROUND',(0,0),(-1,0),colors.whitesmoke),
                             ('FONT',(0,0),(-1,0),'Helvetica-Bold')]))
-    story.append(t1)
-    story.append(Spacer(1, 10))
-
-    # Monte Carlo summary
+    story.append(t1); story.append(Spacer(1, 10))
     story.append(Paragraph("<b>Monte-Carlo Summary</b>", styles["Heading2"]))
     mc_items = [[k, f"{v:,.2f}"] for k,v in mc_summary.items()]
     t2 = Table(mc_items, colWidths=[8*cm, 4*cm])
     t2.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey)]))
-    story.append(t2)
-    story.append(Spacer(1, 10))
-
-    story.append(Paragraph("Notes: This model uses regime-based, correlated simulations with discrete risk events. "
+    story.append(t2); story.append(Spacer(1, 10))
+    story.append(Paragraph("Notes: Regime-based, correlated simulations with discrete risk events. "
                            "All results are estimates and not financial advice.", styles["Italic"]))
-    doc.build(story)
-    buf.seek(0)
+    doc.build(story); buf.seek(0)
     return buf.getvalue()
 
 st.subheader("📄 Export")
-col_pdf, col_csv = st.columns([1,1])
-with col_pdf:
-    pdf_bytes = build_pdf(project, met, summary)
-    st.download_button("Download Investor PDF", data=pdf_bytes,
+left, right = st.columns([1,1])
+with left:
+    pdf_bytes = build_pdf(project, met, summary_single)
+    st.download_button("Download Investor PDF (Single Project)", data=pdf_bytes,
                        file_name=f"{project.project_name.replace(' ','_')}_Investor_Report.pdf",
                        mime="application/pdf")
-with col_csv:
+with right:
     cf_csv = df_base.to_csv(index=False).encode("utf-8")
     st.download_button("Download Base Cashflow CSV", cf_csv, file_name="cashflow_timeline_base.csv", mime="text/csv")
 
-# Simulation CSV (full)
-sim_csv = sim_df.to_csv(index=False).encode("utf-8")
-st.download_button("Download Simulation Results CSV", sim_csv, file_name="simulation_results.csv", mime="text/csv")
+# Simulation CSVs
+st.download_button("Download Single-Project Simulation CSV", sim_df_single.to_csv(index=False).encode("utf-8"),
+                   file_name="simulation_single.csv", mime="text/csv")
 
-st.caption("© 2025 Oracle Intelligence — Prototype build for Etibar. All results are estimates and not financial advice.")
+st.caption("© 2025 Oracle Intelligence — Portfolio Edition for Etibar. All results are estimates and not financial advice.")
